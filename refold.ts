@@ -294,7 +294,8 @@ export interface RefoldOptions {
     /** The session token. */
     token?: string;
     /**
-     * The single-use code from a connect URL, traded for a session token on the first request.
+     * The single-use code from a connect URL, traded for a session token as soon as the SDK is
+     * constructed. Instances on one page given the same code share that exchange.
      * Prefer this over `token`: a code that reaches the wrong person is already spent, whereas a
      * token stays usable until it expires. Ignored if `token` is also given.
      */
@@ -540,9 +541,9 @@ const POLL_INTERVAL = 3e3;
 /** How long, in milliseconds, polling continues after the wait times out, since the connection may complete moments later. */
 const POLL_GRACE = 6e3;
 /**
- * Identifies one SDK instance to the connect-code exchange. Not a secret — it only proves a retry
- * comes from the same caller — but there is no point emitting a guessable one, so an environment
- * without crypto gets nothing and forgoes the retry instead.
+ * Identifies this page's claim on a connect code to the exchange. Not a secret — it only proves a
+ * retry comes from the same caller — but there is no point emitting a guessable one, so an
+ * environment without crypto gets nothing and forgoes the retry instead.
  */
 const randomId = (): string | undefined => {
     const c: Crypto | undefined = globalThis.crypto;
@@ -552,6 +553,14 @@ const randomId = (): string | undefined => {
     }
     return undefined;
 };
+
+/**
+ * Connect-code exchanges for this page, by API and code. A code is spendable once, so it is
+ * exchanged once per page rather than once per instance — an app that builds a new `Refold` per
+ * call or per render would otherwise spend it on the first and fail on every later one. Held in
+ * memory only, like the token.
+ */
+const exchanges = new Map<string, { claim?: string; token?: Promise<string> }>();
 
 /** The number of consecutive polling failures tolerated before authentication is aborted. */
 const MAX_POLL_FAILURES = 3;
@@ -573,8 +582,6 @@ class Refold {
     private baseUrl: string;
     public token: string;
     private code: string;
-    private claim?: string;
-    private exchange?: Promise<string>;
 
     /**
      * Refold Frontend SDK
@@ -593,11 +600,6 @@ class Refold {
         this.code = options.code || "";
 
         if (this.code && !this.token) {
-            // Identifies this instance to the exchange, so a request whose response never arrived
-            // can be retried by us and only us. Minted before the first attempt, since that is the
-            // case it exists for. Without a source of randomness we send nothing rather than
-            // something guessable, and simply forgo the retry.
-            this.claim = randomId();
             // Exchanged up front, not on the first call. `connect()` opens a popup immediately
             // after its request, and browsers drop user activation across a network round-trip —
             // an exchange in that path gets the popup blocked. Failures are swallowed here and
@@ -607,9 +609,9 @@ class Refold {
     }
 
     /**
-     * The `Authorization` header every request carries. A code is traded for its session token on
-     * first use and the token is then held in memory only, so it never reaches the URL, storage or
-     * anywhere else the page can leak it.
+     * The `Authorization` header every request carries. A code's session token comes from the
+     * exchange the constructor started, and is held in memory only, so it never reaches the URL,
+     * storage or anywhere else the page can leak it.
      * @private
      */
     private async bearer(): Promise<string> {
@@ -618,17 +620,23 @@ class Refold {
     }
 
     /**
-     * The one in-flight exchange for this instance. A code is spendable once, so concurrent calls
-     * share it rather than race. A failure is not cached — a spent code fails again anyway, while
-     * caching the rejection would let one network blip brick the instance for good.
+     * The page's one exchange of this code, shared by every call and every instance given it, so
+     * none of them races another to spend it. A failure is not cached — a spent code fails again
+     * anyway, while caching the rejection would let one network blip brick the page for good.
      * @private
      */
     private startExchange(): Promise<string> {
-        this.exchange ??= this.exchangeCode(this.code, this.claim).catch(error => {
-            this.exchange = undefined;
+        const key = `${this.baseUrl} ${this.code}`;
+        // The claim id lets a request whose response never arrived be retried by us and only us,
+        // so it is minted before the first attempt and kept across retries. Without a source of
+        // randomness we send nothing rather than something guessable, and forgo the retry.
+        const entry = exchanges.get(key) ?? { claim: randomId() };
+        exchanges.set(key, entry);
+        entry.token ??= this.exchangeCode(this.code, entry.claim).catch(error => {
+            entry.token = undefined;
             throw error;
         });
-        return this.exchange;
+        return entry.token;
     }
 
     /**

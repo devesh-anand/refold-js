@@ -35,8 +35,12 @@
 
 <p>Prefer <code>code</code>. It is spent the first time the SDK uses it, so a connect URL that
 reaches the wrong person is already worthless — a session token in the same place
-stays usable until it expires. The SDK trades the code for a token on its first
-request and holds that token in memory only.</p>
+stays usable until it expires. The SDK trades the code for a token as soon as it
+is constructed and holds that token in memory only.</p>
+<p>Create one instance per page load, in the browser, with a code minted on your
+backend for that page load. Instances on the same page given the same code share
+one exchange, but a reload, a second tab, or constructing the SDK during
+server-side rendering each spends the code again — and a spent code is rejected.</p>
 <h1 id="documentation" class="tsd-anchor-link">Documentation<a href="#documentation" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="assets/icons.svg#icon-anchor"></use></svg></a></h1>
 <ul>
 <li>

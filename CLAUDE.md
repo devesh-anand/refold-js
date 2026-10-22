@@ -33,7 +33,7 @@ The entire SDK is a single `Refold` class using native `fetch` API. No external 
 ### Authentication
 - Bearer token auth via `Authorization` header on all requests, assembled by the private `bearer()` helper that every call site routes through
 - Token set via constructor option or `refold.token = "..."` after initialization
-- Alternatively a single-use `code` (from a `/connect/<code>` URL) is exchanged for a session token on the first request via `POST /api/v2/public/connect-code/exchange`. The exchange is unauthenticated — possession of the code is the credential — is deduplicated so concurrent calls spend the code once, and is not cached on failure so a network blip stays retryable. An explicit `token` wins over a `code`.
+- Alternatively a single-use `code` (from a `/connect/<code>` URL) is exchanged for a session token in the constructor (so `connect()`'s popup is not opened behind a round-trip) via `POST /api/v2/public/connect-code/exchange`. The exchange is unauthenticated — possession of the code is the credential — is shared per page by every call and every instance given the same code (a module-level map keyed by base URL + code) so the code is spent once, and is not cached on failure so a network blip stays retryable. An explicit `token` wins over a `code`.
 - Default base URL: `https://app.refold.ai` (configurable via `baseUrl` option)
 
 ### Public API

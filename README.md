@@ -62,8 +62,13 @@ refold.token = "REFOLD_SESSION_TOKEN";
 
 Prefer `code`. It is spent the first time the SDK uses it, so a connect URL that
 reaches the wrong person is already worthless — a session token in the same place
-stays usable until it expires. The SDK trades the code for a token on its first
-request and holds that token in memory only.
+stays usable until it expires. The SDK trades the code for a token as soon as it
+is constructed and holds that token in memory only.
+
+Create one instance per page load, in the browser, with a code minted on your
+backend for that page load. Instances on the same page given the same code share
+one exchange, but a reload, a second tab, or constructing the SDK during
+server-side rendering each spends the code again — and a spent code is rejected.
 
 # Documentation
 

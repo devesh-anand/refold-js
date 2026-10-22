@@ -60,9 +60,9 @@ const POLL_INTERVAL = 3e3;
 /** How long, in milliseconds, polling continues after the wait times out, since the connection may complete moments later. */
 const POLL_GRACE = 6e3;
 /**
- * Identifies one SDK instance to the connect-code exchange. Not a secret — it only proves a retry
- * comes from the same caller — but there is no point emitting a guessable one, so an environment
- * without crypto gets nothing and forgoes the retry instead.
+ * Identifies this page's claim on a connect code to the exchange. Not a secret — it only proves a
+ * retry comes from the same caller — but there is no point emitting a guessable one, so an
+ * environment without crypto gets nothing and forgoes the retry instead.
  */
 const randomId = () => {
     const c = globalThis.crypto;
@@ -73,6 +73,13 @@ const randomId = () => {
     }
     return undefined;
 };
+/**
+ * Connect-code exchanges for this page, by API and code. A code is spendable once, so it is
+ * exchanged once per page rather than once per instance — an app that builds a new `Refold` per
+ * call or per render would otherwise spend it on the first and fail on every later one. Held in
+ * memory only, like the token.
+ */
+const exchanges = new Map();
 /** The number of consecutive polling failures tolerated before authentication is aborted. */
 const MAX_POLL_FAILURES = 3;
 /** The default maximum time, in milliseconds, to wait for authentication. */
@@ -99,11 +106,6 @@ class Refold {
         this.token = options.token || "";
         this.code = options.code || "";
         if (this.code && !this.token) {
-            // Identifies this instance to the exchange, so a request whose response never arrived
-            // can be retried by us and only us. Minted before the first attempt, since that is the
-            // case it exists for. Without a source of randomness we send nothing rather than
-            // something guessable, and simply forgo the retry.
-            this.claim = randomId();
             // Exchanged up front, not on the first call. `connect()` opens a popup immediately
             // after its request, and browsers drop user activation across a network round-trip —
             // an exchange in that path gets the popup blocked. Failures are swallowed here and
@@ -112,9 +114,9 @@ class Refold {
         }
     }
     /**
-     * The `Authorization` header every request carries. A code is traded for its session token on
-     * first use and the token is then held in memory only, so it never reaches the URL, storage or
-     * anywhere else the page can leak it.
+     * The `Authorization` header every request carries. A code's session token comes from the
+     * exchange the constructor started, and is held in memory only, so it never reaches the URL,
+     * storage or anywhere else the page can leak it.
      * @private
      */
     bearer() {
@@ -125,18 +127,24 @@ class Refold {
         });
     }
     /**
-     * The one in-flight exchange for this instance. A code is spendable once, so concurrent calls
-     * share it rather than race. A failure is not cached — a spent code fails again anyway, while
-     * caching the rejection would let one network blip brick the instance for good.
+     * The page's one exchange of this code, shared by every call and every instance given it, so
+     * none of them races another to spend it. A failure is not cached — a spent code fails again
+     * anyway, while caching the rejection would let one network blip brick the page for good.
      * @private
      */
     startExchange() {
-        var _a;
-        (_a = this.exchange) !== null && _a !== void 0 ? _a : (this.exchange = this.exchangeCode(this.code, this.claim).catch(error => {
-            this.exchange = undefined;
+        var _a, _b;
+        const key = `${this.baseUrl} ${this.code}`;
+        // The claim id lets a request whose response never arrived be retried by us and only us,
+        // so it is minted before the first attempt and kept across retries. Without a source of
+        // randomness we send nothing rather than something guessable, and forgo the retry.
+        const entry = (_a = exchanges.get(key)) !== null && _a !== void 0 ? _a : { claim: randomId() };
+        exchanges.set(key, entry);
+        (_b = entry.token) !== null && _b !== void 0 ? _b : (entry.token = this.exchangeCode(this.code, entry.claim).catch(error => {
+            entry.token = undefined;
             throw error;
         }));
-        return this.exchange;
+        return entry.token;
     }
     /**
      * Claims a connect code, which spends it. Unauthenticated by construction — possession of the

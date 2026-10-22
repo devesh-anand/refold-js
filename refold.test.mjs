@@ -18,18 +18,20 @@ function stubFetch(handler) {
 
 const ok = (body) => ({ status: 200, json: async () => body });
 
+// Exchanges are shared per code across the whole module, so every test spends a code of its own.
+
 test("exchanges a code for a session token before the first request", async () => {
     const calls = stubFetch((url) =>
         url.includes("/connect-code/exchange") ? ok({ token: "session-jwt" }) : ok([]));
 
-    const refold = new Refold({ code: "the-code" });
+    const refold = new Refold({ code: "code-1" });
     await refold.getApps();
 
     assert.equal(calls.length, 2);
     assert.match(calls[0].url, /\/api\/v2\/public\/connect-code\/exchange$/);
     assert.equal(calls[0].init.method, "POST");
     const body = JSON.parse(calls[0].init.body);
-    assert.equal(body.code, "the-code");
+    assert.equal(body.code, "code-1");
     // Proves the retry is ours and only ours: a different browser presents a different id.
     assert.match(body.claim_id, /^[0-9a-f-]{32,36}$/);
     assert.equal(calls[1].init.headers.authorization, "Bearer session-jwt");
@@ -40,7 +42,7 @@ test("sends no credential of its own when claiming the code", async () => {
     const calls = stubFetch((url) =>
         url.includes("/connect-code/exchange") ? ok({ token: "session-jwt" }) : ok([]));
 
-    await new Refold({ code: "the-code" }).getApps();
+    await new Refold({ code: "code-2" }).getApps();
 
     // Possession of the code is the credential; an API key must never reach the browser.
     assert.equal(calls[0].init.headers.authorization, undefined);
@@ -50,11 +52,27 @@ test("spends the code once even when several calls race", async () => {
     const calls = stubFetch((url) =>
         url.includes("/connect-code/exchange") ? ok({ token: "session-jwt" }) : ok([]));
 
-    const refold = new Refold({ code: "the-code" });
+    const refold = new Refold({ code: "code-3" });
     await Promise.all([ refold.getApps(), refold.getApps(), refold.getApps() ]);
 
     const exchanges = calls.filter(c => c.url.includes("/connect-code/exchange"));
     assert.equal(exchanges.length, 1);
+});
+
+test("instances given the same code share one exchange", async () => {
+    // Apps that build an instance per render or per call, and React StrictMode constructing twice,
+    // would otherwise spend the code on the first instance and fail on every later one.
+    const calls = stubFetch((url) =>
+        url.includes("/connect-code/exchange") ? ok({ token: "session-jwt" }) : ok([]));
+
+    const first = new Refold({ code: "shared-code" });
+    const second = new Refold({ code: "shared-code" });
+    await Promise.all([ first.getApps(), second.getApps() ]);
+    const later = new Refold({ code: "shared-code" });
+    await later.getApps();
+
+    assert.equal(calls.filter(c => c.url.includes("/connect-code/exchange")).length, 1);
+    for (const refold of [ first, second, later ]) assert.equal(refold.token, "session-jwt");
 });
 
 test("keeps the session token in memory, never in browser storage", async () => {
@@ -65,7 +83,7 @@ test("keeps the session token in memory, never in browser storage", async () => 
     globalThis.sessionStorage = store;
 
     try {
-        await new Refold({ code: "the-code" }).getApps();
+        await new Refold({ code: "code-4" }).getApps();
         assert.deepEqual(written, []);
     } finally {
         delete globalThis.localStorage;
@@ -78,7 +96,7 @@ test("exchanges up front, so connect() does not open a popup behind a round-trip
     // after its request, so the exchange must already be done by the time anyone clicks.
     const calls = stubFetch(() => ok({ token: "session-jwt" }));
 
-    new Refold({ code: "the-code" });
+    new Refold({ code: "code-5" });
     await new Promise(r => setImmediate(r));
 
     assert.equal(calls.length, 1);
@@ -93,7 +111,7 @@ test("retries with the same claim id, so the exchange recognises us", async () =
         return ok({ token: "session-jwt" });
     });
 
-    const refold = new Refold({ code: "the-code" });
+    const refold = new Refold({ code: "code-6" });
     await assert.rejects(refold.getApps(), /network down/);
     await refold.getApps();
 
@@ -106,7 +124,7 @@ test("reports the status when the exchange is misrouted and returns HTML", async
     // surface "Unexpected token <" and send the integrator hunting the wrong problem.
     stubFetch(() => ({ status: 404, json: async () => { throw new SyntaxError("Unexpected token <"); } }));
 
-    await assert.rejects(new Refold({ code: "x" }).getApps(), (err) => {
+    await assert.rejects(new Refold({ code: "code-7" }).getApps(), (err) => {
         assert.equal(err.code, "EXCHANGE_FAILED");
         assert.equal(err.status, 404);
         assert.match(err.message, /HTTP 404/);
@@ -117,7 +135,7 @@ test("reports the status when the exchange is misrouted and returns HTML", async
 test("rejects a 200 that carries no session token", async () => {
     stubFetch((url) => url.includes("/connect-code/exchange") ? ok({}) : ok([]));
 
-    await assert.rejects(new Refold({ code: "x" }).getApps(), (err) => {
+    await assert.rejects(new Refold({ code: "code-8" }).getApps(), (err) => {
         assert.equal(err.code, "EXCHANGE_FAILED");
         return true;
     });
@@ -135,7 +153,7 @@ test("uses a raw token as before, with no exchange", async () => {
 test("prefers an explicit token over a code", async () => {
     const calls = stubFetch(() => ok([]));
 
-    await new Refold({ token: "raw-jwt", code: "the-code" }).getApps();
+    await new Refold({ token: "raw-jwt", code: "code-10" }).getApps();
 
     assert.equal(calls.filter(c => c.url.includes("/connect-code/exchange")).length, 0);
     assert.equal(calls[0].init.headers.authorization, "Bearer raw-jwt");
@@ -168,7 +186,7 @@ test("does not cache a failed exchange, so a network blip is retryable", async (
         return ok({ token: "session-jwt" });
     });
 
-    const refold = new Refold({ code: "the-code" });
+    const refold = new Refold({ code: "code-13" });
     await assert.rejects(refold.getApps(), /network down/);
     await refold.getApps();
 

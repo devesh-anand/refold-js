@@ -269,7 +269,8 @@ export interface RefoldOptions {
     /** The session token. */
     token?: string;
     /**
-     * The single-use code from a connect URL, traded for a session token on the first request.
+     * The single-use code from a connect URL, traded for a session token as soon as the SDK is
+     * constructed. Instances on one page given the same code share that exchange.
      * Prefer this over `token`: a code that reaches the wrong person is already spent, whereas a
      * token stays usable until it expires. Ignored if `token` is also given.
      */
@@ -496,8 +497,6 @@ declare class Refold {
     private baseUrl;
     token: string;
     private code;
-    private claim?;
-    private exchange?;
     /**
      * Refold Frontend SDK
      * @param {Object} options The options to configure the Refold SDK.
@@ -507,16 +506,16 @@ declare class Refold {
      */
     constructor(options?: RefoldOptions);
     /**
-     * The `Authorization` header every request carries. A code is traded for its session token on
-     * first use and the token is then held in memory only, so it never reaches the URL, storage or
-     * anywhere else the page can leak it.
+     * The `Authorization` header every request carries. A code's session token comes from the
+     * exchange the constructor started, and is held in memory only, so it never reaches the URL,
+     * storage or anywhere else the page can leak it.
      * @private
      */
     private bearer;
     /**
-     * The one in-flight exchange for this instance. A code is spendable once, so concurrent calls
-     * share it rather than race. A failure is not cached — a spent code fails again anyway, while
-     * caching the rejection would let one network blip brick the instance for good.
+     * The page's one exchange of this code, shared by every call and every instance given it, so
+     * none of them races another to spend it. A failure is not cached — a spent code fails again
+     * anyway, while caching the rejection would let one network blip brick the page for good.
      * @private
      */
     private startExchange;
