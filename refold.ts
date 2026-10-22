@@ -18,6 +18,7 @@ export enum ConnectorAuthType {
     ApiKey = "api_key",
     BasicAuth = "basic_auth",
     BearerToken = "bearer_token",
+    NoAuth = "noauth",
 }
 
 export enum AuthStatus {
@@ -79,16 +80,29 @@ export interface Application {
          */
         [authType in AuthType | ConnectorAuthType]?: InputField[];
     };
+    /**
+     * Whether the application supports several connections per linked account. Absent,
+     * rather than `false`, for the applications that do not.
+     */
+    has_multi_auth_enabled?: boolean;
     /** The list of connected accounts for this application */
     connected_accounts?: {
+        /** Names this connection to the methods that act on one. */
+        connection_id?: string;
+        /** The credential set this connection was opened against. */
+        auth_profile_id?: string;
+        /** The display name of the `auth_profile_id` above. */
+        auth_profile_name?: string;
         /** The identifier (username, email, etc.) of the connected account. */
         identifier: unknown;
         /** The auth type used to connect the account. */
-        auth_type: AuthType;
+        auth_type?: AuthType | ConnectorAuthType;
         /** The timestamp at which the account was connected. */
         connectedAt: string;
         /** The current status of the connection. */
         status?: AuthStatus;
+        /** Caller-supplied metadata stored against this connection. */
+        user_defined_fields?: Record<string, unknown>;
     }[];
     /**
      * The type of auth used by application.
@@ -135,7 +149,26 @@ export interface InputField  {
     }[];
 }
 
-export interface OAuthParams {
+/** Which credentials a connect uses, and what to store against the connection. */
+export interface ConnectionTarget {
+    /**
+     * The credential set to connect with, from an application's auth profiles. Omitted,
+     * the application's default profile is used.
+     */
+    authProfileId?: string;
+    /** An existing connection to re-authenticate instead of opening a new one. */
+    connectionId?: string;
+    /** Caller metadata to store against the connection. */
+    userDefinedFields?: Record<string, unknown>;
+    /**
+     * Values the application requires before it can be connected. Read by applications
+     * on auth profiles and by connectors; other native applications take theirs as flat
+     * keys in `payload`.
+     */
+    preRequisiteFields?: Record<string, unknown>;
+}
+
+export interface OAuthParams extends ConnectionTarget {
     /** The application slug. */
     slug: string;
     /** The key value pairs of auth data. */
@@ -149,13 +182,20 @@ export interface OAuthParams {
      * explicitly and it is not needed.
      */
     grantType?: GrantType;
-    /** Whether to close the authentication window automatically. */
+    /** Whether to close the authentication window automatically once the connection succeeds or the wait times out. */
     autoClose?: boolean;
-    /** Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 5 minutes. */
+    /** Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 3 minutes. */
     timeout?: number;
+    /**
+     * Signal used to give up on an in-progress authentication — abort it and the
+     * returned promise resolves `false`. Providers that sever the authentication
+     * window's handle make an abandoned flow undetectable, so this is the only way
+     * to end such a wait before the `timeout`.
+     */
+    signal?: AbortSignal;
 }
 
-export interface KeyBasedParams {
+export interface KeyBasedParams extends ConnectionTarget {
     /** The application slug. */
     slug: string;
     /** The key value pairs of auth data. */
@@ -179,12 +219,25 @@ export interface ConnectParams extends OAuthParams {
     type?: AuthType | ConnectorAuthType;
 }
 
+/**
+ * Names the connection a call acts on. An account holds one config per connection under
+ * the same `config_id`, so `config_id` alone does not identify one. Omitted, the call
+ * targets the default connection, which an application on auth profiles may not have —
+ * writing a config for one without naming its connection is rejected.
+ */
+export interface ConnectionScoped {
+    /** The unique ID of the connection, from {@link Application.connected_accounts}. */
+    connectionId?: string;
+}
+
 /** The payload object for config. */
 export interface ConfigPayload {
     /** The application slug. */
     slug: string;
     /**  Unique ID for the config. */
     config_id?: string;
+    /** The connection this config belongs to. See {@link ConnectionScoped}. */
+    connection_id?: string;
     /** The dynamic label mappings. */
     labels?: Label[];
 }
@@ -203,6 +256,8 @@ export interface UpdateConfigPayload {
     slug: string;
     /** Unique ID for the config. */
     config_id?: string;
+    /** The connection this config belongs to. See {@link ConnectionScoped}. */
+    connection_id?: string;
     /** A map of application fields and their values. */
     fields: Record<string, string | number | boolean>;
     /** The config workflows data. */
@@ -229,6 +284,8 @@ export interface ToggleConfigWorkflowPayload {
     workflow_id: string;
     /** Whether the workflow should be enabled. */
     enabled: boolean;
+    /** The connection this config belongs to. See {@link ConnectionScoped}. */
+    connection_id?: string;
 }
 
 export interface RefoldOptions {
@@ -355,6 +412,11 @@ interface PaginatedResponse<T> {
 export interface Config {
     slug: string;
     config_id?: string;
+    /**
+     * The connection this config belongs to. An account on auth profiles holds one
+     * config per connection under the same `config_id`.
+     */
+    connection_id?: string;
     fields?: ConfigField[];
     workflows?: ConfigWorkflow[];
     field_errors?: {
@@ -415,6 +477,13 @@ export interface ExecuteWorkflowPayload {
     payload?: Record<string, any>;
     /** Whether to execute the workflow synchronously. */
     sync_execution?: boolean;
+    /** The config to execute against. */
+    config_id?: string;
+    /**
+     * The connection to authenticate the run through. One `config_id` can span several
+     * connections, so send both to name the config and the credentials.
+     */
+    connection_id?: string;
 }
 
 export interface Execution {
@@ -468,7 +537,7 @@ type Field = any;
 
 /** How often, in milliseconds, connection status is polled during authentication. */
 const POLL_INTERVAL = 3e3;
-/** How long, in milliseconds, polling continues after the auth window closes or the wait times out, since the connection may complete moments later. */
+/** How long, in milliseconds, polling continues after the wait times out, since the connection may complete moments later. */
 const POLL_GRACE = 6e3;
 /**
  * Identifies one SDK instance to the connect-code exchange. Not a secret — it only proves a retry
@@ -487,7 +556,18 @@ const randomId = (): string | undefined => {
 /** The number of consecutive polling failures tolerated before authentication is aborted. */
 const MAX_POLL_FAILURES = 3;
 /** The default maximum time, in milliseconds, to wait for authentication. */
-const DEFAULT_CONNECT_TIMEOUT = 300e3;
+const DEFAULT_CONNECT_TIMEOUT = 180e3;
+
+/**
+ * The connect body's non-credential keys. They sit alongside the credentials rather than
+ * nested, because the server reads every other key as a credential.
+ */
+const connectTarget = (params: ConnectionTarget): Record<string, unknown> => ({
+    ...(params.authProfileId ? { auth_profile_id: params.authProfileId } : {}),
+    ...(params.connectionId ? { connection_id: params.connectionId } : {}),
+    ...(params.userDefinedFields ? { user_defined_fields: params.userDefinedFields } : {}),
+    ...(params.preRequisiteFields ? { pre_requisite_fields: params.preRequisiteFields } : {}),
+});
 
 class Refold {
     private baseUrl: string;
@@ -706,7 +786,7 @@ class Refold {
      */
     private async integrate(
         slug: string,
-        params?: Record<string, string>,
+        params?: Record<string, unknown>,
     ): Promise<{ auth_url?: string; connected?: boolean }> {
         const url = `${this.baseUrl}/api/v1/${slug}/integrate`;
         const res = await fetch(url, {
@@ -732,8 +812,9 @@ class Refold {
      * @param params - The parameters for the OAuth flow.
      * @param params.slug - The application slug.
      * @param params.payload - The key value pairs of auth data.
-     * @param params.autoClose - Whether to close the authentication window automatically. Defaults to `true`.
-     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 5 minutes.
+     * @param params.autoClose - Whether to close the authentication window automatically once the connection succeeds or the wait times out. Defaults to `true`.
+     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 3 minutes.
+     * @param params.signal - Signal used to give up on the authentication and resolve `false`.
      * @returns {Promise<Boolean>} Whether the user authenticated.
      */
     private async oauth({
@@ -741,8 +822,23 @@ class Refold {
         payload,
         autoClose = true,
         timeout = DEFAULT_CONNECT_TIMEOUT,
+        signal,
+        authProfileId,
+        connectionId,
+        userDefinedFields,
+        preRequisiteFields,
     }: OAuthParams): Promise<boolean> {
-        const data = await this.integrate(slug, payload);
+        if (signal?.aborted) return false;
+
+        // The connections held before this connect, which the success test below reads.
+        // Awaited only after the window opens: a round-trip between the click and
+        // `window.open` is what strict popup blockers reject. Failure falls back.
+        const snapshotRequest = this.getApp(slug).catch(() => undefined);
+
+        const data = await this.integrate(slug, {
+            ...payload,
+            ...connectTarget({ authProfileId, connectionId, userDefinedFields, preRequisiteFields }),
+        });
 
         // No auth_url ⇒ the server completed the connection without a redirect
         // (client-credentials / M2M); report the outcome it gives us. A response
@@ -764,8 +860,34 @@ class Refold {
             );
         }
 
-        const hasActiveOAuthAccount = (app: Application) =>
-            Boolean(app?.connected_accounts?.filter(a => a.auth_type === AuthType.OAuth2).some(a => a.status === AuthStatus.Active));
+        const snapshot = await snapshotRequest;
+
+        type ConnectedAccount = NonNullable<Application["connected_accounts"]>[number];
+
+        const liveOAuthAccounts = (app?: Application): ConnectedAccount[] =>
+            (app?.connected_accounts ?? []).filter(account =>
+                account.auth_type === AuthType.OAuth2 && account.status === AuthStatus.Active);
+
+        // `connectedAt` tracks the connection's last write, so re-authenticating an
+        // existing connection changes its stamp without changing its id.
+        const fingerprint = (account: ConnectedAccount) => `${account.connection_id ?? ""}|${account.connectedAt}`;
+
+        const baseline = new Set(liveOAuthAccounts(snapshot).map(fingerprint));
+
+        /**
+         * Whether the connection this call opened is live. Where an application holds
+         * several, an account connected earlier would otherwise resolve the wait at once
+         * and close the window mid-authentication, so the account has to be one the
+         * snapshot did not already have live.
+         */
+        const isConnected = (app: Application): boolean => {
+            if (!app?.has_multi_auth_enabled || !snapshot) {
+                return liveOAuthAccounts(app).length > 0;
+            }
+            return liveOAuthAccounts(app)
+                .filter(account => !connectionId || account.connection_id === connectionId)
+                .some(account => !baseline.has(fingerprint(account)));
+        };
 
         return new Promise((resolve, reject) => {
             const startedAt = Date.now();
@@ -773,18 +895,42 @@ class Refold {
             let consecutiveFailures = 0;
             let firstFailure: unknown;
             let graceStartedAt: number | undefined;
+            let handleTrusted: boolean | undefined;
+
+            const stop = () => {
+                clearInterval(interval);
+                signal?.removeEventListener("abort", onAbort);
+            };
+
+            const onAbort = () => {
+                stop();
+                if (autoClose) connectWindow.close();
+                resolve(false);
+            };
 
             // keep checking connection status
             const interval = setInterval(() => {
+                // A provider serving any page in the auth chain with a `same-origin`
+                // Cross-Origin-Opener-Policy has it placed in a new browsing context
+                // group, discarding the context `window.open` returned: the handle
+                // then reports `closed` for a window that is still open, and
+                // `close()` on it is a no-op. Since that is indistinguishable from a
+                // genuine close, `closed` counts only once the handle has been seen
+                // alive — and as it never returns to `false`, this first reading
+                // settles the question for the whole run. The severing response
+                // arrives before the user can read the page it renders and close the
+                // window, so shortening POLL_INTERVAL narrows that margin.
+                handleTrusted ??= !connectWindow.closed;
+
                 const timedOut = timeout > 0 && Date.now() - startedAt >= timeout;
-                if (connectWindow.closed || timedOut) {
-                    // the connection may complete moments around the window
-                    // closing or the wait timing out, so keep polling for a
-                    // little longer before giving up
+                if ((handleTrusted && connectWindow.closed) || timedOut) {
+                    // the connection may complete moments around the window closing
+                    // or the wait timing out, so keep polling for a little longer
+                    // before giving up
                     if (timedOut && autoClose) connectWindow.close();
                     graceStartedAt ??= Date.now();
                     if (Date.now() - graceStartedAt >= POLL_GRACE) {
-                        clearInterval(interval);
+                        stop();
                         resolve(false);
                         return;
                     }
@@ -799,12 +945,10 @@ class Refold {
                     inFlight = false;
                     consecutiveFailures = 0;
                     firstFailure = undefined;
-                    if (hasActiveOAuthAccount(app)) {
+                    if (isConnected(app)) {
                         // close auth window
                         if (autoClose) connectWindow.close();
-                        // clear interval
-                        clearInterval(interval);
-                        // resolve status
+                        stop();
                         resolve(true);
                     }
                 })
@@ -815,11 +959,15 @@ class Refold {
                     consecutiveFailures += 1;
                     firstFailure ??= e;
                     if (consecutiveFailures >= MAX_POLL_FAILURES) {
-                        clearInterval(interval);
+                        stop();
                         reject(firstFailure);
                     }
                 });
             }, POLL_INTERVAL);
+
+            signal?.addEventListener("abort", onAbort);
+            // the signal may have been aborted while /integrate was in flight
+            if (signal?.aborted) onAbort();
         });
     }
 
@@ -834,6 +982,10 @@ class Refold {
         slug,
         payload,
         authType,
+        authProfileId,
+        connectionId,
+        userDefinedFields,
+        preRequisiteFields,
     }: KeyBasedParams): Promise<boolean> {
         // A connector offering several key-based types needs to be told which one; the generic
         // `keybased` is not one of them, so it is not forwarded and an application's body stays
@@ -849,6 +1001,7 @@ class Refold {
             body: JSON.stringify({
                 ...payload,
                 ...(connectorAuthType ? { auth_type: connectorAuthType } : {}),
+                ...connectTarget({ authProfileId, connectionId, userDefinedFields, preRequisiteFields }),
             }),
         });
 
@@ -868,8 +1021,13 @@ class Refold {
      * @param params.type - The authentication type to use. If not provided, it defaults to `keybased` if payload is provided, otherwise `oauth2`.
      * @param params.payload - key-value pairs of authentication data required for the specified auth type.
      * @param params.grantType - The application's OAuth grant. Pass {@link GrantType.ClientCredentials} for machine-to-machine connectors (fields are submitted to the server, no window opens). Omit for redirect grants.
-     * @param params.autoClose - Whether to close the authentication window automatically. If not provided, it defaults to `true`.
-     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Only applicable to the OAuth2 flow. Set to `0` to wait indefinitely. If not provided, it defaults to 5 minutes.
+     * @param params.autoClose - Whether to close the authentication window automatically once the connection succeeds or the wait times out. If not provided, it defaults to `true`.
+     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Only applicable to the OAuth2 flow. Set to `0` to wait indefinitely. If not provided, it defaults to 3 minutes.
+     * @param params.signal - Signal used to give up on an in-progress OAuth2 authentication, resolving the returned promise `false`. Providers that sever the authentication window's handle make an abandoned flow undetectable, so this is the only way to end such a wait before the `timeout`.
+     * @param params.authProfileId - The credential set to connect with, for an application offering several.
+     * @param params.connectionId - An existing connection to re-authenticate rather than opening a new one.
+     * @param params.userDefinedFields - Caller metadata to store against the connection.
+     * @param params.preRequisiteFields - Values the application requires before connecting.
      * @returns A promise that resolves to true if the connection was successful, otherwise false.
      * @throws Throws an error if the authentication type is invalid or the connection fails.
      */
@@ -880,19 +1038,25 @@ class Refold {
         grantType,
         autoClose = true,
         timeout = DEFAULT_CONNECT_TIMEOUT,
+        signal,
+        authProfileId,
+        connectionId,
+        userDefinedFields,
+        preRequisiteFields,
     }: ConnectParams): Promise<boolean> {
+        const target = { authProfileId, connectionId, userDefinedFields, preRequisiteFields };
         switch (type) {
             case AuthType.OAuth2:
-                return this.oauth({ slug, payload, grantType, autoClose, timeout });
+                return this.oauth({ slug, payload, grantType, autoClose, timeout, signal, ...target });
             case AuthType.KeyBased:
-                return this.keybased({ slug, payload, authType: type });
+                return this.keybased({ slug, payload, authType: type, ...target });
             default:
                 // client-credentials (M2M) is OAuth2 but carries a payload, so it
                 // must not be mistaken for a key-based connect.
                 if (grantType === GrantType.ClientCredentials)
-                    return this.oauth({ slug, payload, grantType, autoClose, timeout });
-                if (payload) return this.keybased({ slug, payload, authType: type });
-                return this.oauth({ slug, grantType, autoClose, timeout });
+                    return this.oauth({ slug, payload, grantType, autoClose, timeout, signal, ...target });
+                if (payload) return this.keybased({ slug, payload, authType: type, ...target });
+                return this.oauth({ slug, grantType, autoClose, timeout, signal, ...target });
         }
     }
 
@@ -900,10 +1064,12 @@ class Refold {
      * Disconnect the specified application and remove any associated data from Refold.
      * @param {String} slug The application slug.
      * @param {AuthType} [type] The authentication type to use. If not provided, it'll remove all the connected accounts.
+     * @param {ConnectionScoped} [opts] Names the connection to revoke. Required where the
+     *   application holds more than one; the server answers 400 rather than choosing.
      * @returns {Promise<unknown>}
      */
-    public async disconnect(slug: string, type?: AuthType): Promise<unknown> {
-        const res = await fetch(`${this.baseUrl}/api/v1/linked-acc/integration/${slug}${type ? `?auth_type=${type}` : ""}`, {
+    public async disconnect(slug: string, type?: AuthType, opts: ConnectionScoped = {}): Promise<unknown> {
+        const res = await fetch(`${this.baseUrl}/api/v1/linked-acc/integration/${slug}${this.query({ auth_type: type, connection_id: opts.connectionId })}`, {
             method: "DELETE",
             headers: {
                 authorization: await this.bearer(),
@@ -945,12 +1111,28 @@ class Refold {
     }
 
     /**
+     * Builds an encoded query string from the params that have a value, `?` included.
+     * Empty when none do.
+     * @private
+     */
+    private query(params: Record<string, string | undefined>): string {
+        const search = new URLSearchParams();
+        for (const key of Object.keys(params)) {
+            const value = params[key];
+            if (value !== undefined && value !== "") search.append(key, value);
+        }
+        const qs = search.toString();
+        return qs ? `?${qs}` : "";
+    }
+
+    /**
      * Returns the configs created for the specified application.
      * @param {String} slug The application slug.
-     * @returns {Promise<{ config_id: string; }[]>} The configs created for the specified application.
+     * @param {ConnectionScoped} [opts] Narrows the result to one connection's configs.
+     * @returns {Promise<{ config_id: string; connection_id?: string; }[]>} The configs created for the specified application.
      */
-    async getConfigs(slug: string): Promise<{ config_id: string; }[]> {
-        const res = await fetch(`${this.baseUrl}/api/v2/public/slug/${slug}/configs`, {
+    async getConfigs(slug: string, opts: ConnectionScoped = {}): Promise<{ config_id: string; connection_id?: string; }[]> {
+        const res = await fetch(`${this.baseUrl}/api/v2/public/slug/${slug}/configs${this.query({ connection_id: opts.connectionId })}`, {
             headers: {
                 authorization: await this.bearer(),
             },
@@ -969,10 +1151,11 @@ class Refold {
      * @param {String} slug The application slug.
      * @param {String} [configId] The unique ID of the config.
      * @param {Boolean} [excludeOptions] Whether to exclude the options from the fields in the response.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<Config>} The specified config.
      */
-    async getConfig(slug: string, configId: string, excludeOptions?: boolean): Promise<Config> {
-        const res = await fetch(`${this.baseUrl}/api/v2/f-sdk/slug/${slug}/config${configId ? `/${configId}` : ""}`, {
+    async getConfig(slug: string, configId: string, excludeOptions?: boolean, opts: ConnectionScoped = {}): Promise<Config> {
+        const res = await fetch(`${this.baseUrl}/api/v2/f-sdk/slug/${slug}/config${configId ? `/${configId}` : ""}${this.query({ connection_id: opts.connectionId })}`, {
             headers: {
                 authorization: await this.bearer(),
                 ...(excludeOptions ? { disable_field_options: "true" } : {}),
@@ -1014,10 +1197,11 @@ class Refold {
      * Delete the specified config.
      * @param {String} slug The application slug.
      * @param {String} [configId] The unique ID of the config.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<unknown>}
      */
-    async deleteConfig(slug: string, configId?: string): Promise<unknown> {
-        const res = await fetch(`${this.baseUrl}/api/v2/f-sdk/slug/${slug}/config${configId ? `/${configId}` : ""}`, {
+    async deleteConfig(slug: string, configId?: string, opts: ConnectionScoped = {}): Promise<unknown> {
+        const res = await fetch(`${this.baseUrl}/api/v2/f-sdk/slug/${slug}/config${configId ? `/${configId}` : ""}${this.query({ connection_id: opts.connectionId })}`, {
             method: "DELETE",
             headers: {
                 authorization: await this.bearer(),
@@ -1038,8 +1222,8 @@ class Refold {
      * @returns {Promise<ConfigWorkflow[]>} The updated list of workflows in the config.
      */
     async toggleConfigWorkflow(payload: ToggleConfigWorkflowPayload): Promise<ConfigWorkflow[]> {
-        const { slug, config_id, workflow_id, enabled } = payload;
-        const res = await fetch(`${this.baseUrl}/api/v2/public/slug/${slug}/config/${config_id}/workflows/${workflow_id}`, {
+        const { slug, config_id, workflow_id, enabled, connection_id } = payload;
+        const res = await fetch(`${this.baseUrl}/api/v2/public/slug/${slug}/config/${config_id}/workflows/${workflow_id}${this.query({ connection_id })}`, {
             method: "PATCH",
             headers: {
                 authorization: await this.bearer(),
@@ -1063,10 +1247,11 @@ class Refold {
      * @param {String} fieldId The unique ID of the field.
      * @param {String} [workflowId] The unique ID of the workflow.
      * @param {Record<string, unknown>} [payload] The payload to be sent in the request body.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<Field>} The specified config field.
      */
-    async getConfigField(slug: string, fieldId: string, workflowId?: string, payload?: Record<string, unknown>): Promise<Config> {
-        const res = await fetch(`${this.baseUrl}/api/v2/public/config/field/${fieldId}${workflowId ? `?workflow_id=${workflowId}` : ""}`, {
+    async getConfigField(slug: string, fieldId: string, workflowId?: string, payload?: Record<string, unknown>, opts: ConnectionScoped = {}): Promise<Config> {
+        const res = await fetch(`${this.baseUrl}/api/v2/public/config/field/${fieldId}${this.query({ workflow_id: workflowId, connection_id: opts.connectionId })}`, {
             method: "POST",
             headers: {
                 authorization: await this.bearer(),
@@ -1090,10 +1275,11 @@ class Refold {
      * @param {String} fieldId The unique ID of the field.
      * @param {String | Number | Boolean | null} value The new value for the field.
      * @param {String} [workflowId] The unique ID of the workflow.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<Field>} The updated config field.
      */
-    async updateConfigField(slug: string, fieldId: string, value: string | number | boolean | null, workflowId?: string): Promise<Config> {
-        const res = await fetch(`${this.baseUrl}/api/v2/public/config/field/${fieldId}${workflowId ? `?workflow_id=${workflowId}` : ""}`, {
+    async updateConfigField(slug: string, fieldId: string, value: string | number | boolean | null, workflowId?: string, opts: ConnectionScoped = {}): Promise<Config> {
+        const res = await fetch(`${this.baseUrl}/api/v2/public/config/field/${fieldId}${this.query({ workflow_id: workflowId, connection_id: opts.connectionId })}`, {
             method: "PUT",
             headers: {
                 authorization: await this.bearer(),
@@ -1116,10 +1302,11 @@ class Refold {
      * @param {String} slug The application slug.
      * @param {String} fieldId The unique ID of the field.
      * @param {String} [workflowId] The unique ID of the workflow.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<unknown>}
      */
-    async deleteConfigField(slug: string, fieldId: string, workflowId?: string): Promise<unknown> {
-        const res = await fetch(`${this.baseUrl}/api/v2/public/config/field/${fieldId}${workflowId ? `?workflow_id=${workflowId}` : ""}`, {
+    async deleteConfigField(slug: string, fieldId: string, workflowId?: string, opts: ConnectionScoped = {}): Promise<unknown> {
+        const res = await fetch(`${this.baseUrl}/api/v2/public/config/field/${fieldId}${this.query({ workflow_id: workflowId, connection_id: opts.connectionId })}`, {
             method: "DELETE",
             headers: {
                 authorization: await this.bearer(),
@@ -1141,10 +1328,11 @@ class Refold {
      * @param {String} slug The application slug.
      * @param {String} fieldId The unique ID of the field.
      * @param {String} [workflowId] The unique ID of the workflow, if this is a workflow field.
+     * @param {ConnectionScoped} [opts] Names the connection whose config to resolve against.
      * @returns {Promise<RuleOptions>} The specified rule field's options.
      */
-    async getFieldOptions(lhs: string, slug: string, fieldId: string, workflowId?: string): Promise<RuleOptions> {
-        const res = await fetch(`${this.baseUrl}/api/v2/public/config/rule-engine/${fieldId}${workflowId ? `?workflow_id=${workflowId}` : ""}`, {
+    async getFieldOptions(lhs: string, slug: string, fieldId: string, workflowId?: string, opts: ConnectionScoped = {}): Promise<RuleOptions> {
+        const res = await fetch(`${this.baseUrl}/api/v2/public/config/rule-engine/${fieldId}${this.query({ workflow_id: workflowId, connection_id: opts.connectionId })}`, {
             method: "POST",
             headers: {
                 authorization: await this.bearer(),
@@ -1276,6 +1464,8 @@ class Refold {
      * @param {String} options.worklfow The workflow id or alias.
      * @param {String} [options.slug] The application's slug this workflow belongs to. Slug is required if you're using workflow alias.
      * @param {Record<string, any>} [options.payload] The execution payload.
+     * @param {String} [options.config_id] The config to execute against.
+     * @param {String} [options.connection_id] The connection to authenticate the run through.
      * @returns {Promise<unknown>}
      */
     async executeWorkflow(options: ExecuteWorkflowPayload): Promise<unknown> {
@@ -1286,6 +1476,9 @@ class Refold {
                 "content-type": "application/json",
                 slug: options?.slug || "",
                 sync_execution: options?.sync_execution ? "true" : "false",
+                // Read from headers only, and by presence — so omit rather than send empty.
+                ...(options?.config_id ? { config_id: options.config_id } : {}),
+                ...(options?.connection_id ? { connection_id: options.connection_id } : {}),
             },
             body: JSON.stringify(options?.payload),
         });

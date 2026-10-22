@@ -15,7 +15,8 @@ export declare enum ConnectorAuthType {
     OAuth2 = "oauth2",
     ApiKey = "api_key",
     BasicAuth = "basic_auth",
-    BearerToken = "bearer_token"
+    BearerToken = "bearer_token",
+    NoAuth = "noauth"
 }
 export declare enum AuthStatus {
     Active = "active",
@@ -66,16 +67,29 @@ export interface Application {
     auth_type_options?: {
         [authType in AuthType | ConnectorAuthType]?: InputField[];
     };
+    /**
+     * Whether the application supports several connections per linked account. Absent,
+     * rather than `false`, for the applications that do not.
+     */
+    has_multi_auth_enabled?: boolean;
     /** The list of connected accounts for this application */
     connected_accounts?: {
+        /** Names this connection to the methods that act on one. */
+        connection_id?: string;
+        /** The credential set this connection was opened against. */
+        auth_profile_id?: string;
+        /** The display name of the `auth_profile_id` above. */
+        auth_profile_name?: string;
         /** The identifier (username, email, etc.) of the connected account. */
         identifier: unknown;
         /** The auth type used to connect the account. */
-        auth_type: AuthType;
+        auth_type?: AuthType | ConnectorAuthType;
         /** The timestamp at which the account was connected. */
         connectedAt: string;
         /** The current status of the connection. */
         status?: AuthStatus;
+        /** Caller-supplied metadata stored against this connection. */
+        user_defined_fields?: Record<string, unknown>;
     }[];
     /**
      * The type of auth used by application.
@@ -120,7 +134,25 @@ export interface InputField {
         value: string;
     }[];
 }
-export interface OAuthParams {
+/** Which credentials a connect uses, and what to store against the connection. */
+export interface ConnectionTarget {
+    /**
+     * The credential set to connect with, from an application's auth profiles. Omitted,
+     * the application's default profile is used.
+     */
+    authProfileId?: string;
+    /** An existing connection to re-authenticate instead of opening a new one. */
+    connectionId?: string;
+    /** Caller metadata to store against the connection. */
+    userDefinedFields?: Record<string, unknown>;
+    /**
+     * Values the application requires before it can be connected. Read by applications
+     * on auth profiles and by connectors; other native applications take theirs as flat
+     * keys in `payload`.
+     */
+    preRequisiteFields?: Record<string, unknown>;
+}
+export interface OAuthParams extends ConnectionTarget {
     /** The application slug. */
     slug: string;
     /** The key value pairs of auth data. */
@@ -134,12 +166,19 @@ export interface OAuthParams {
      * explicitly and it is not needed.
      */
     grantType?: GrantType;
-    /** Whether to close the authentication window automatically. */
+    /** Whether to close the authentication window automatically once the connection succeeds or the wait times out. */
     autoClose?: boolean;
-    /** Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 5 minutes. */
+    /** Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 3 minutes. */
     timeout?: number;
+    /**
+     * Signal used to give up on an in-progress authentication — abort it and the
+     * returned promise resolves `false`. Providers that sever the authentication
+     * window's handle make an abandoned flow undetectable, so this is the only way
+     * to end such a wait before the `timeout`.
+     */
+    signal?: AbortSignal;
 }
-export interface KeyBasedParams {
+export interface KeyBasedParams extends ConnectionTarget {
     /** The application slug. */
     slug: string;
     /** The key value pairs of auth data. */
@@ -161,12 +200,24 @@ export interface ConnectParams extends OAuthParams {
      */
     type?: AuthType | ConnectorAuthType;
 }
+/**
+ * Names the connection a call acts on. An account holds one config per connection under
+ * the same `config_id`, so `config_id` alone does not identify one. Omitted, the call
+ * targets the default connection, which an application on auth profiles may not have —
+ * writing a config for one without naming its connection is rejected.
+ */
+export interface ConnectionScoped {
+    /** The unique ID of the connection, from {@link Application.connected_accounts}. */
+    connectionId?: string;
+}
 /** The payload object for config. */
 export interface ConfigPayload {
     /** The application slug. */
     slug: string;
     /**  Unique ID for the config. */
     config_id?: string;
+    /** The connection this config belongs to. See {@link ConnectionScoped}. */
+    connection_id?: string;
     /** The dynamic label mappings. */
     labels?: Label[];
 }
@@ -183,6 +234,8 @@ export interface UpdateConfigPayload {
     slug: string;
     /** Unique ID for the config. */
     config_id?: string;
+    /** The connection this config belongs to. See {@link ConnectionScoped}. */
+    connection_id?: string;
     /** A map of application fields and their values. */
     fields: Record<string, string | number | boolean>;
     /** The config workflows data. */
@@ -207,6 +260,8 @@ export interface ToggleConfigWorkflowPayload {
     workflow_id: string;
     /** Whether the workflow should be enabled. */
     enabled: boolean;
+    /** The connection this config belongs to. See {@link ConnectionScoped}. */
+    connection_id?: string;
 }
 export interface RefoldOptions {
     /** The base URL of the Refold API. You don't need to set this. */
@@ -322,6 +377,11 @@ interface PaginatedResponse<T> {
 export interface Config {
     slug: string;
     config_id?: string;
+    /**
+     * The connection this config belongs to. An account on auth profiles holds one
+     * config per connection under the same `config_id`.
+     */
+    connection_id?: string;
     fields?: ConfigField[];
     workflows?: ConfigWorkflow[];
     field_errors?: {
@@ -378,6 +438,13 @@ export interface ExecuteWorkflowPayload {
     payload?: Record<string, any>;
     /** Whether to execute the workflow synchronously. */
     sync_execution?: boolean;
+    /** The config to execute against. */
+    config_id?: string;
+    /**
+     * The connection to authenticate the run through. One `config_id` can span several
+     * connections, so send both to name the config and the credentials.
+     */
+    connection_id?: string;
 }
 export interface Execution {
     _id: string;
@@ -513,8 +580,9 @@ declare class Refold {
      * @param params - The parameters for the OAuth flow.
      * @param params.slug - The application slug.
      * @param params.payload - The key value pairs of auth data.
-     * @param params.autoClose - Whether to close the authentication window automatically. Defaults to `true`.
-     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 5 minutes.
+     * @param params.autoClose - Whether to close the authentication window automatically once the connection succeeds or the wait times out. Defaults to `true`.
+     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Set to `0` to wait indefinitely. Defaults to 3 minutes.
+     * @param params.signal - Signal used to give up on the authentication and resolve `false`.
      * @returns {Promise<Boolean>} Whether the user authenticated.
      */
     private oauth;
@@ -533,19 +601,26 @@ declare class Refold {
      * @param params.type - The authentication type to use. If not provided, it defaults to `keybased` if payload is provided, otherwise `oauth2`.
      * @param params.payload - key-value pairs of authentication data required for the specified auth type.
      * @param params.grantType - The application's OAuth grant. Pass {@link GrantType.ClientCredentials} for machine-to-machine connectors (fields are submitted to the server, no window opens). Omit for redirect grants.
-     * @param params.autoClose - Whether to close the authentication window automatically. If not provided, it defaults to `true`.
-     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Only applicable to the OAuth2 flow. Set to `0` to wait indefinitely. If not provided, it defaults to 5 minutes.
+     * @param params.autoClose - Whether to close the authentication window automatically once the connection succeeds or the wait times out. If not provided, it defaults to `true`.
+     * @param params.timeout - Maximum time in milliseconds to wait for authentication before giving up. Only applicable to the OAuth2 flow. Set to `0` to wait indefinitely. If not provided, it defaults to 3 minutes.
+     * @param params.signal - Signal used to give up on an in-progress OAuth2 authentication, resolving the returned promise `false`. Providers that sever the authentication window's handle make an abandoned flow undetectable, so this is the only way to end such a wait before the `timeout`.
+     * @param params.authProfileId - The credential set to connect with, for an application offering several.
+     * @param params.connectionId - An existing connection to re-authenticate rather than opening a new one.
+     * @param params.userDefinedFields - Caller metadata to store against the connection.
+     * @param params.preRequisiteFields - Values the application requires before connecting.
      * @returns A promise that resolves to true if the connection was successful, otherwise false.
      * @throws Throws an error if the authentication type is invalid or the connection fails.
      */
-    connect({ slug, type, payload, grantType, autoClose, timeout, }: ConnectParams): Promise<boolean>;
+    connect({ slug, type, payload, grantType, autoClose, timeout, signal, authProfileId, connectionId, userDefinedFields, preRequisiteFields, }: ConnectParams): Promise<boolean>;
     /**
      * Disconnect the specified application and remove any associated data from Refold.
      * @param {String} slug The application slug.
      * @param {AuthType} [type] The authentication type to use. If not provided, it'll remove all the connected accounts.
+     * @param {ConnectionScoped} [opts] Names the connection to revoke. Required where the
+     *   application holds more than one; the server answers 400 rather than choosing.
      * @returns {Promise<unknown>}
      */
-    disconnect(slug: string, type?: AuthType): Promise<unknown>;
+    disconnect(slug: string, type?: AuthType, opts?: ConnectionScoped): Promise<unknown>;
     /**
      * Returns the specified config, or creates one if it doesn't exist.
      * @param {ConfigPayload} payload The payload object for config.
@@ -553,21 +628,30 @@ declare class Refold {
      */
     config(payload: ConfigPayload): Promise<Config>;
     /**
+     * Builds an encoded query string from the params that have a value, `?` included.
+     * Empty when none do.
+     * @private
+     */
+    private query;
+    /**
      * Returns the configs created for the specified application.
      * @param {String} slug The application slug.
-     * @returns {Promise<{ config_id: string; }[]>} The configs created for the specified application.
+     * @param {ConnectionScoped} [opts] Narrows the result to one connection's configs.
+     * @returns {Promise<{ config_id: string; connection_id?: string; }[]>} The configs created for the specified application.
      */
-    getConfigs(slug: string): Promise<{
+    getConfigs(slug: string, opts?: ConnectionScoped): Promise<{
         config_id: string;
+        connection_id?: string;
     }[]>;
     /**
      * Returns the specified config.
      * @param {String} slug The application slug.
      * @param {String} [configId] The unique ID of the config.
      * @param {Boolean} [excludeOptions] Whether to exclude the options from the fields in the response.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<Config>} The specified config.
      */
-    getConfig(slug: string, configId: string, excludeOptions?: boolean): Promise<Config>;
+    getConfig(slug: string, configId: string, excludeOptions?: boolean, opts?: ConnectionScoped): Promise<Config>;
     /**
      * Update the specified config.
      * @param {UpdateConfigPayload} payload The update payload.
@@ -578,9 +662,10 @@ declare class Refold {
      * Delete the specified config.
      * @param {String} slug The application slug.
      * @param {String} [configId] The unique ID of the config.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<unknown>}
      */
-    deleteConfig(slug: string, configId?: string): Promise<unknown>;
+    deleteConfig(slug: string, configId?: string, opts?: ConnectionScoped): Promise<unknown>;
     /**
      * Enables or disables a single workflow within a config, without re-installing the config.
      * @param {ToggleConfigWorkflowPayload} payload The toggle payload.
@@ -593,35 +678,39 @@ declare class Refold {
      * @param {String} fieldId The unique ID of the field.
      * @param {String} [workflowId] The unique ID of the workflow.
      * @param {Record<string, unknown>} [payload] The payload to be sent in the request body.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<Field>} The specified config field.
      */
-    getConfigField(slug: string, fieldId: string, workflowId?: string, payload?: Record<string, unknown>): Promise<Config>;
+    getConfigField(slug: string, fieldId: string, workflowId?: string, payload?: Record<string, unknown>, opts?: ConnectionScoped): Promise<Config>;
     /**
      * Update the specified config field value.
      * @param {String} slug The application slug.
      * @param {String} fieldId The unique ID of the field.
      * @param {String | Number | Boolean | null} value The new value for the field.
      * @param {String} [workflowId] The unique ID of the workflow.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<Field>} The updated config field.
      */
-    updateConfigField(slug: string, fieldId: string, value: string | number | boolean | null, workflowId?: string): Promise<Config>;
+    updateConfigField(slug: string, fieldId: string, value: string | number | boolean | null, workflowId?: string, opts?: ConnectionScoped): Promise<Config>;
     /**
      * Delete the specified config field value.
      * @param {String} slug The application slug.
      * @param {String} fieldId The unique ID of the field.
      * @param {String} [workflowId] The unique ID of the workflow.
+     * @param {ConnectionScoped} [opts] Names the connection whose config this acts on.
      * @returns {Promise<unknown>}
      */
-    deleteConfigField(slug: string, fieldId: string, workflowId?: string): Promise<unknown>;
+    deleteConfigField(slug: string, fieldId: string, workflowId?: string, opts?: ConnectionScoped): Promise<unknown>;
     /**
      * Returns the options for the specified field.
      * @param {String} lhs The selected value of the lhs field.
      * @param {String} slug The application slug.
      * @param {String} fieldId The unique ID of the field.
      * @param {String} [workflowId] The unique ID of the workflow, if this is a workflow field.
+     * @param {ConnectionScoped} [opts] Names the connection whose config to resolve against.
      * @returns {Promise<RuleOptions>} The specified rule field's options.
      */
-    getFieldOptions(lhs: string, slug: string, fieldId: string, workflowId?: string): Promise<RuleOptions>;
+    getFieldOptions(lhs: string, slug: string, fieldId: string, workflowId?: string, opts?: ConnectionScoped): Promise<RuleOptions>;
     /**
      * Returns the private workflows for the specified application.
      * @param {Object} params
@@ -663,6 +752,8 @@ declare class Refold {
      * @param {String} options.worklfow The workflow id or alias.
      * @param {String} [options.slug] The application's slug this workflow belongs to. Slug is required if you're using workflow alias.
      * @param {Record<string, any>} [options.payload] The execution payload.
+     * @param {String} [options.config_id] The config to execute against.
+     * @param {String} [options.connection_id] The connection to authenticate the run through.
      * @returns {Promise<unknown>}
      */
     executeWorkflow(options: ExecuteWorkflowPayload): Promise<unknown>;
